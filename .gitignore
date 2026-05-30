@@ -1,0 +1,21 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Runtime artifacts
+bot.pid
+bot_log.txt
+logs/
+.cache/
+
+# Backtest output
+*.html
+*.csv
+
+# OS
+.DS_Store
