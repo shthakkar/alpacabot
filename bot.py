@@ -26,7 +26,7 @@ from signals      import check_signal
 from options      import resolve_option
 from orders       import (
     is_market_open, list_positions, list_open_orders,
-    submit_market_buy_bracket, wait_for_fill, get_order,
+    submit_market_buy, wait_for_fill, get_order,
 )
 from trade_manager import TradeManager, EOD_EXIT_TIME
 
@@ -35,8 +35,21 @@ log = logging.getLogger("bot")
 log.setLevel(logging.INFO)
 _fmt = logging.Formatter("%(asctime)s  %(message)s",
                           datefmt="%Y-%m-%d %H:%M:%S")
+
+# Full log — stdout (redirected to logs/bot_YYYYMMDD.log by run_bot.sh)
 _sh = logging.StreamHandler(sys.stdout); _sh.setFormatter(_fmt); log.addHandler(_sh)
-_fh = logging.FileHandler("bot_log.txt"); _fh.setFormatter(_fmt); log.addHandler(_fh)
+
+# Events log — signals, entries, exits, errors only (no heartbeat lines)
+class _EventsFilter(logging.Filter):
+    _SKIP = ("IDLE ", "⏸ outside hours")
+    def filter(self, record):
+        return not any(s in record.getMessage() for s in self._SKIP)
+
+_logdate = datetime.now().strftime("%Y%m%d")
+_ef = logging.FileHandler(f"logs/events_{_logdate}.log")
+_ef.setFormatter(_fmt)
+_ef.addFilter(_EventsFilter())
+log.addHandler(_ef)
 
 # ---------------- knobs ----------------
 ACTIVE_START_TIME = dt_time(MARKET_OPEN.hour, MARKET_OPEN.minute)   # 10:00 ET
@@ -206,23 +219,12 @@ class Bot:
             log.warning(f"  ⚠ spread ${opt['spread']:.2f} > ${MAX_SPREAD:.2f} — skipping entry")
             return
 
-        # BRACKET market BUY for entry. Take-profit/stop child legs are
-        # attached atomically — this sidesteps Alpaca's wash-trade and
-        # "uncovered option" rejections we'd otherwise hit when submitting
-        # SELL stop/target after the BUY avg-up legs were already pending.
-        # Bracket children are sized off the option's current ask (close
-        # enough to the actual fill that the small slippage is acceptable).
-        approx_entry = opt["ask"]
-        tp_price     = approx_entry * (1 + LIMIT_TARGET_PCT)
-        sl_price     = approx_entry * (1 - STOP_PCT)
+        # Plain market BUY. Stop SELL is submitted by TradeManager before
+        # the avg-up BUYs so Alpaca's wash-trade check doesn't fire.
+        # Target exits are poll-only (no standing SELL order at Alpaca).
         try:
-            entry = submit_market_buy_bracket(
-                opt["symbol"], qty=1,
-                take_profit_price=tp_price,
-                stop_loss_price=sl_price,
-            )
-            log.info(f"  📥 BRACKET BUY submitted  id={entry.id} "
-                     f"tp=${tp_price:.2f} sl=${sl_price:.2f}")
+            entry = submit_market_buy(opt["symbol"], qty=1)
+            log.info(f"  📥 BUY submitted  id={entry.id}")
             filled = wait_for_fill(entry.id, timeout=ENTRY_FILL_TIMEOUT)
         except TimeoutError:
             log.error(f"  ❌ entry order didn't fill in {ENTRY_FILL_TIMEOUT}s")
@@ -238,25 +240,8 @@ class Bot:
         fill_price = float(filled.filled_avg_price)
         log.info(f"  ✅ ENTRY FILLED @ ${fill_price:.2f}")
 
-        # Pull child IDs from the parent's legs (now that parent is filled)
-        target_id = stop_id = None
-        try:
-            parent = get_order(entry.id)
-            legs = list(parent.legs or [])
-            # The TakeProfit child is a SELL LIMIT; the StopLoss child is a SELL STOP.
-            for leg in legs:
-                if leg.order_type.value == "limit":
-                    target_id = leg.id
-                elif leg.order_type.value in ("stop", "stop_limit"):
-                    stop_id = leg.id
-            log.info(f"     bracket children: target={target_id} stop={stop_id}")
-        except Exception as e:
-            log.warning(f"  ⚠ couldn't read bracket children: {e}")
-
-        # Hand off to trade manager — pass child IDs so it skips re-submitting
         self.trade = TradeManager(
             opt["symbol"], direction, fill_price, now,
-            target_id=target_id, stop_id=stop_id,
         )
         try:
             self.trade.submit_management_orders()

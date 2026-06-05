@@ -82,36 +82,33 @@ class TradeManager:
     # ---------- setup ----------
     def submit_management_orders(self):
         """
-        Submit avg-up orders. Stop + target are normally already live as
-        bracket children attached to the entry; if the IDs are missing
-        (e.g. dry-run, bracket unsupported), fall back to submitting them
-        as independent orders.
+        Submit stop SELL first (before any BUY orders exist so Alpaca's
+        wash-trade check doesn't fire), then the avg-up BUYs.
+        No standing target SELL — Alpaca rejects a second SELL on the same
+        contract as "uncovered option". The +6% target is caught by the
+        bid poll in tick(); +8% fallback is also poll-based.
         """
         au1_trg = self.avg_cost * (1 + AVG_UP_1_PCT)
         au1_lim = au1_trg + AVG_UP_LIMIT_OFFSET
         au2_trg = self.avg_cost * (1 + AVG_UP_2_PCT)
         au2_lim = au2_trg + AVG_UP_LIMIT_OFFSET
 
+        # Stop SELL must go in before the avg-up BUYs
+        if self.order_ids["stop"] is None:
+            self.order_ids["stop"] = submit_stop_market_sell(
+                self.symbol, 1, self.stop_price).id
+
         self.order_ids["avg_up_1"] = submit_stop_limit_buy(
             self.symbol, 1, au1_trg, au1_lim).id
         self.order_ids["avg_up_2"] = submit_stop_limit_buy(
             self.symbol, 1, au2_trg, au2_lim).id
 
-        # Fallback path — only needed if entry wasn't a bracket
-        if self.order_ids["stop"] is None:
-            self.order_ids["stop"] = submit_stop_market_sell(
-                self.symbol, 1, self.stop_price).id
-        if self.order_ids["target"] is None:
-            self.order_ids["target"] = submit_limit_sell(
-                self.symbol, 1, self.limit_target_price).id
-
         log.info(
             f"  📋 Standing orders set:"
+            f"\n     stop    : market-stop @ {self.stop_price:.2f}    id={self.order_ids['stop']}"
             f"\n     avg_up_1: stop {au1_trg:.2f} lim {au1_lim:.2f}  id={self.order_ids['avg_up_1']}"
             f"\n     avg_up_2: stop {au2_trg:.2f} lim {au2_lim:.2f}  id={self.order_ids['avg_up_2']}"
-            f"\n     stop    : market-stop @ {self.stop_price:.2f}    id={self.order_ids['stop']}"
-            f"\n     safety  : limit @ {self.limit_target_price:.2f} (+8% safety-net) id={self.order_ids['target']}"
-            f"\n     poll trg: bid ≥ {self.target_price:.2f} (+6% market-sell)"
+            f"\n     poll trg: bid ≥ {self.target_price:.2f} (+6%) / {self.limit_target_price:.2f} (+8%)"
         )
 
     # ---------- main loop entry (called every 30s by bot.py) ----------
@@ -132,12 +129,19 @@ class TradeManager:
             self._force_close("EOD")
             return True
 
-        # 3. Active +6% target — poll bid; if at/above, market-sell now
+        # 3. Poll bid for both stop and target exits
         try:
             bid = get_quote(self.symbol).get("bid")
         except Exception as e:
-            log.warning(f"  ⚠ target poll quote failed: {e}")
+            log.warning(f"  ⚠ bid poll quote failed: {e}")
             bid = None
+        if bid is not None and bid <= self.stop_price:
+            log.info(
+                f"  🛑 STOP HIT (poll) bid=${bid:.2f} ≤ ${self.stop_price:.2f}"
+                f" → market-sell"
+            )
+            self._force_close("STOP")
+            return True
         if bid is not None and bid >= self.target_price:
             log.info(
                 f"  🎯 TARGET HIT (poll) bid=${bid:.2f} ≥ ${self.target_price:.2f}"
@@ -207,18 +211,15 @@ class TradeManager:
         if which == 1: self.avg_up_1_done = True
         else:          self.avg_up_2_done = True
 
-        # Atomic PATCH on existing orders — no cancel→resubmit gap.
-        # replace_order returns a NEW order with a new id; capture it.
+        # Atomic PATCH on the stop order — resize qty and move stop price.
+        # No standing target order (poll-only), so only stop is resized.
         self.order_ids["stop"] = self._resize("stop",
             qty=self.contracts, stop_price=self.stop_price)
-        self.order_ids["target"] = self._resize("target",
-            qty=self.contracts)
 
         log.info(
             f"  → contracts={self.contracts}  avg_cost={self.avg_cost:.2f}"
-            f"  new_stop={self.stop_price:.2f}  target={self.target_price:.2f} (unchanged)"
+            f"  new_stop={self.stop_price:.2f}  poll_tgt={self.target_price:.2f} (unchanged)"
             f"\n     new stop  id={self.order_ids['stop']}"
-            f"\n     new target id={self.order_ids['target']}"
         )
 
     def _resize(self, key: str, **changes):
