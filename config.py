@@ -35,6 +35,10 @@ AVG_UP_2_PCT     = 0.030
 STOP_PCT         = 0.088
 TARGET_PCT       = 0.060   # bid-poll threshold — bot market-sells once bid ≥ entry × this
 LIMIT_TARGET_PCT = 0.080   # safety-net LIMIT submitted at Alpaca — fires if bot is offline
+TOTAL_BUDGET           = 1000  # skip entry if ask × 100 exceeds this
+AVG_UP_BUDGET_PER_SLOT = 500   # allow avg-ups only if ask × 100 ≤ this
+DAILY_LOSS_LIMIT       = 200   # stop taking new trades if realized P&L ≤ −$200
+LOSS_COOLDOWN_MIN      = 10    # minutes to wait before next entry after a losing trade
 
 # Time-based exit — close trade after this many minutes regardless of P&L
 # (protects against theta decay on short-dated options)

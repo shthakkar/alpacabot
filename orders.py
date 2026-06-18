@@ -54,6 +54,11 @@ def is_market_open() -> bool:
 # ----------------------------------------------------------------
 # Positions
 # ----------------------------------------------------------------
+def get_buying_power() -> float:
+    """Current options buying power from the account."""
+    return float(_trading.get_account().buying_power)
+
+
 def list_positions() -> list:
     """All currently open positions."""
     return _trading.get_all_positions()

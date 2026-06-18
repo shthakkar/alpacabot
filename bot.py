@@ -4,7 +4,7 @@
 # State machine:
 #   IDLE  ──[signal fires]──►  IN_TRADE  ──[exit hits]──► IDLE
 #
-# 30-second poll loop. Refuses to run unless PAPER=True.
+# 30-second poll loop.
 #
 # Run:
 #   python3 bot.py
@@ -19,14 +19,15 @@ import pandas as pd
 
 from config       import (PAPER, CHECK_SECS, ET,
                           MARKET_OPEN, MARKET_CLOSE, LAST_ENTRY,
-                          LIMIT_TARGET_PCT, STOP_PCT)
+                          LIMIT_TARGET_PCT, STOP_PCT, DAILY_LOSS_LIMIT,
+                          LOSS_COOLDOWN_MIN)
 from data         import fetch_spy_bars
 from indicators   import add_indicators
 from signals      import check_signal
 from options      import resolve_option
 from orders       import (
     is_market_open, list_positions, list_open_orders,
-    submit_market_buy, wait_for_fill, get_order,
+    submit_market_buy, wait_for_fill, get_order, get_buying_power,
 )
 from trade_manager import TradeManager, EOD_EXIT_TIME
 
@@ -57,13 +58,18 @@ LAST_ENTRY_TIME   = dt_time(LAST_ENTRY.hour, LAST_ENTRY.minute)     # 15:15 ET �
 ACTIVE_END_TIME   = EOD_EXIT_TIME                                    # 15:45 ET — force-close
 MAX_SPREAD        = 0.50      # skip entry if bid-ask spread wider than this
 ENTRY_FILL_TIMEOUT = 30       # seconds to wait for entry market order to fill
-STALE_DATA_SEC    = 300       # skip cycle if latest bar > 5 min old
+STALE_DATA_SEC    = 420       # skip cycle if latest bar > 7 min old (covers 5-min bar + IEX latency)
+FROZEN_BAR_LIMIT  = 12        # same bar seen 12×30s = 6 min → likely frozen feed
 
 
 class Bot:
     def __init__(self):
         self.trade: TradeManager | None = None
         self._shutting_down = False
+        self._last_bar_ts = None
+        self._frozen_count = 0
+        self.daily_pnl = 0.0
+        self._loss_cooldown_until: datetime | None = None
 
     # ---------- startup ----------
     def startup_checks(self):
@@ -80,11 +86,6 @@ class Bot:
         log.info(f"  Avg-ups       : +1.5% / +3.0% (stop-limit BUY)")
         log.info(f"  Time exit     : 30 min")
         log.info("=" * 60)
-
-        if not PAPER:
-            log.error("  ❌ Refusing to run: PAPER=False")
-            log.error("     Set PAPER=True in config.py for paper trading.")
-            sys.exit(1)
 
         # Refuse to start if any SPY option position is already open
         positions = list_positions()
@@ -147,8 +148,7 @@ class Bot:
             # Trade still open at boundary — let the manager force-close
             done = self.trade.tick(now)
             if done:
-                log.info(f"  ✅ trade closed: {self.trade.summary()}")
-                self.trade = None
+                self._close_trade()
             return
 
         if self.trade is None:
@@ -179,6 +179,16 @@ class Bot:
             log.warning(f"  ⚠ data stale by {staleness:.0f}s — skipping cycle")
             return
 
+        # Frozen feed detection — same bar repeated too many times
+        if latest_ts == self._last_bar_ts:
+            self._frozen_count += 1
+            if self._frozen_count >= FROZEN_BAR_LIMIT:
+                log.warning(f"  ⚠ bar frozen at {latest_ts} for {self._frozen_count} cycles — feed may be stuck")
+                return
+        else:
+            self._frozen_count = 0
+            self._last_bar_ts = latest_ts
+
         df = add_indicators(df)
         call_sig, put_sig, price = check_signal(df)
 
@@ -197,6 +207,15 @@ class Bot:
 
         if wind_down:
             log.info(f"  ⏳ signal fired but past LAST_ENTRY {LAST_ENTRY_TIME} ET — skipping entry")
+            return
+
+        if self.daily_pnl <= -DAILY_LOSS_LIMIT:
+            log.warning(f"  🚫 daily loss limit hit (${self.daily_pnl:+.2f}) — no new entries today")
+            return
+
+        if self._loss_cooldown_until and now < self._loss_cooldown_until:
+            remaining = int((self._loss_cooldown_until - now).total_seconds() / 60) + 1
+            log.info(f"  ⏳ loss cooldown active — {remaining}min remaining, skipping entry")
             return
 
         direction = "CALL" if call_sig else "PUT"
@@ -219,11 +238,41 @@ class Bot:
             log.warning(f"  ⚠ spread ${opt['spread']:.2f} > ${MAX_SPREAD:.2f} — skipping entry")
             return
 
+        entry_cost = opt["ask"] * 100  # cost of 1 contract
+
+        # Dynamic position sizing based on current buying power.
+        # max_per_trade = half the account. slots = how many contracts fit
+        # assuming worst-case avg-up 2 price (entry × 1.03).
+        # entry_qty = slots − 2 (reserve 2 for avg-ups), capped at 5.
+        try:
+            buying_power = get_buying_power()
+        except Exception as e:
+            log.warning(f"  ⚠ couldn't fetch buying power: {e} — skipping entry")
+            return
+
+        max_per_trade = buying_power / 2
+        slots = int(max_per_trade / (entry_cost * 1.03))
+
+        if slots < 3:
+            entry_qty      = 1
+            allowed_avg_ups = 0
+        elif slots == 3:
+            entry_qty      = 1
+            allowed_avg_ups = 2
+        else:
+            entry_qty      = min(slots - 2, 5)  # cap at 5
+            allowed_avg_ups = 2
+
+        log.info(
+            f"     sizing: buying_power=${buying_power:.0f}  max_per_trade=${max_per_trade:.0f}"
+            f"  slots={slots}  entry_qty={entry_qty}  avg_ups_allowed={allowed_avg_ups}"
+        )
+
         # Plain market BUY. Stop SELL is submitted by TradeManager before
         # the avg-up BUYs so Alpaca's wash-trade check doesn't fire.
         # Target exits are poll-only (no standing SELL order at Alpaca).
         try:
-            entry = submit_market_buy(opt["symbol"], qty=1)
+            entry = submit_market_buy(opt["symbol"], qty=entry_qty)
             log.info(f"  📥 BUY submitted  id={entry.id}")
             filled = wait_for_fill(entry.id, timeout=ENTRY_FILL_TIMEOUT)
         except TimeoutError:
@@ -242,6 +291,8 @@ class Bot:
 
         self.trade = TradeManager(
             opt["symbol"], direction, fill_price, now,
+            entry_qty=entry_qty,
+            allowed_avg_ups=allowed_avg_ups,
         )
         try:
             self.trade.submit_management_orders()
@@ -259,8 +310,20 @@ class Bot:
             return
 
         if done:
-            log.info(f"  ✅ trade closed: {self.trade.summary()}")
-            self.trade = None
+            self._close_trade()
+
+    def _close_trade(self):
+        """Log trade close, update daily P&L, set cooldown on loss, clear self.trade."""
+        t = self.trade
+        self.trade = None
+        log.info(f"  ✅ trade closed: {t.summary()}")
+        if t.exit_avg_px is not None:
+            pnl = (t.exit_avg_px - t.avg_cost) * t.contracts * 100
+            self.daily_pnl += pnl
+            log.info(f"  📊 daily P&L: ${self.daily_pnl:+.2f}")
+            if pnl < 0:
+                self._loss_cooldown_until = datetime.now(ET) + timedelta(minutes=LOSS_COOLDOWN_MIN)
+                log.info(f"  ⏳ loss cooldown — no new entries until {self._loss_cooldown_until.strftime('%H:%M:%S')} ET")
 
 
 if __name__ == "__main__":

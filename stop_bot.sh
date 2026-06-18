@@ -3,7 +3,7 @@
 # (graceful shutdown). Falls back to SIGKILL after 90 seconds.
 
 set -u
-BOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BOT_DIR="/Users/manalithakkar/Documents/alpacabot"
 cd "$BOT_DIR"
 
 if [ ! -f bot.pid ]; then

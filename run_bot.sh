@@ -3,18 +3,14 @@
 # Refuses to start if a previous instance is still running.
 
 set -u
-# Resolve the directory this script lives in, so it works from anywhere (incl. cron).
-BOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PYTHON="${PYTHON:-python3}"
+BOT_DIR="/Users/manalithakkar/Documents/alpacabot"
+PYTHON="/Library/Frameworks/Python.framework/Versions/3.10/bin/python3"
 
 cd "$BOT_DIR"
 
-# Load credentials from .env if present (cron runs without your shell env).
+# Load credentials from .env if present
 if [ -f .env ]; then
-    set -a
-    # shellcheck disable=SC1091
-    . ./.env
-    set +a
+    set -a; source .env; set +a
 fi
 
 # Refuse to start if already running
