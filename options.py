@@ -146,8 +146,8 @@ def get_quote(symbol: str) -> dict:
         "symbol":    symbol,
         "bid":       bid,
         "ask":       ask,
-        "mid":       (bid + ask) / 2 if bid and ask else float("nan"),
-        "spread":    ask - bid       if bid and ask else float("nan"),
+        "mid":       (bid + ask) / 2 if bid > 0 and ask > 0 else float("nan"),
+        "spread":    ask - bid       if bid > 0 and ask > 0 else float("nan"),
         "timestamp": q.timestamp,
     }
 

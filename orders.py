@@ -27,6 +27,7 @@ from alpaca.trading.enums     import (
     OrderSide, TimeInForce, OrderStatus, QueryOrderStatus, PositionIntent,
     OrderClass,
 )
+from alpaca.common.exceptions import APIError
 
 from config import API_KEY, API_SECRET, PAPER
 
@@ -56,7 +57,7 @@ def is_market_open() -> bool:
 # ----------------------------------------------------------------
 def get_buying_power() -> float:
     """Current options buying power from the account."""
-    return float(_trading.get_account().buying_power)
+    return float(_trading.get_account().cash)
 
 
 def list_positions() -> list:
@@ -65,11 +66,13 @@ def list_positions() -> list:
 
 
 def get_position(symbol: str):
-    """Position object for `symbol`, or None if flat."""
+    """Position object for `symbol`, or None if flat. Raises on API failure."""
     try:
         return _trading.get_open_position(symbol)
-    except Exception:
-        return None
+    except APIError as e:
+        if "position does not exist" in str(e).lower() or getattr(e, "status_code", None) == 404:
+            return None
+        raise
 
 
 def close_any_position(symbol: str) -> bool:

@@ -139,20 +139,27 @@ class TradeManager:
         states = self._poll_states()
 
         if states["stop"] and states["stop"].status == OrderStatus.FILLED:
-            log.info(f"  🛑 STOP FILLED @ {float(states['stop'].filled_avg_price):.2f}")
-            self.exit_reason = "STOP"
-            self.exit_avg_px = float(states["stop"].filled_avg_price)
-            self._cancel_all_except("stop")
-            return True
+            raw = states["stop"].filled_avg_price
+            if raw is None:
+                log.warning("  ⚠ stop order filled but filled_avg_price is None — skipping")
+            else:
+                log.info(f"  🛑 STOP FILLED @ {float(raw):.2f}")
+                self.exit_reason = "STOP"
+                self.exit_avg_px = float(raw)
+                self._cancel_all_except("stop")
+                return True
         if states["target"] and states["target"].status == OrderStatus.FILLED:
-            log.info(
-                f"  🎯 SAFETY-NET TARGET FILLED @ "
-                f"{float(states['target'].filled_avg_price):.2f}"
-            )
-            self.exit_reason = "TARGET"
-            self.exit_avg_px = float(states["target"].filled_avg_price)
-            self._cancel_all_except("target")
-            return True
+            raw = states["target"].filled_avg_price
+            if raw is None:
+                log.warning("  ⚠ target order filled but filled_avg_price is None — skipping")
+            else:
+                log.info(
+                    f"  🎯 SAFETY-NET TARGET FILLED @ {float(raw):.2f}"
+                )
+                self.exit_reason = "TARGET"
+                self.exit_avg_px = float(raw)
+                self._cancel_all_except("target")
+                return True
 
         # 5. Avg-up poll (bid-based, one per tick to avoid double-buy)
         if bid is not None:
@@ -195,19 +202,29 @@ class TradeManager:
         submit a market BUY, wait for fill, then _handle_avg_up_fill()
         re-submits the stop at the updated price/qty.
         """
+        # Mark done BEFORE submit so we don't retrigger in the same poll.
+        # We reset the flag in the except block if submit fails so the next
+        # tick can retry.
         if which == 1:
-            self.avg_up_1_done = True  # mark before submit so poll doesn't retrigger
+            self.avg_up_1_done = True
         else:
             self.avg_up_2_done = True
         self._cancel_one("stop")  # must clear SELL before BUY or Alpaca rejects
         try:
             order = submit_market_buy(self.symbol, 1)
             filled = wait_for_fill(order.id, timeout=AVG_UP_FILL_TIMEOUT)
+            if filled.filled_avg_price is None:
+                raise ValueError(f"avg-up filled but filled_avg_price is None")
             fill_px = float(filled.filled_avg_price)
             log.info(f"  📈 AVG_UP_{which} FILLED @ ${fill_px:.2f}")
             self._handle_avg_up_fill(which, fill_px)  # re-submits stop inside
         except Exception as e:
             log.error(f"  ❌ avg_up_{which} market-buy failed: {e}")
+            # Reset flag so next tick can retry
+            if which == 1:
+                self.avg_up_1_done = False
+            else:
+                self.avg_up_2_done = False
             # Re-submit stop since we already cancelled it
             try:
                 self.order_ids["stop"] = submit_stop_market_sell(
@@ -224,8 +241,7 @@ class TradeManager:
         self.stop_price = self.avg_cost * (1 - STOP_PCT)
         # Target stays unchanged — it's locked to initial_entry
 
-        if which == 1: self.avg_up_1_done = True
-        else:          self.avg_up_2_done = True
+        # avg_up_N_done was already set True in _execute_avg_up before the BUY fired
 
         # Atomic PATCH on the stop order — resize qty and move stop price.
         # No standing target order (poll-only), so only stop is resized.
@@ -282,7 +298,9 @@ class TradeManager:
         try:
             order = submit_market_sell(self.symbol, self.contracts)
             log.info(f"  🔴 force-sell {self.contracts}x {self.symbol}  id={order.id}")
+            filled = wait_for_fill(order.id, timeout=30)
             self.exit_reason = reason
+            self.exit_avg_px = float(filled.filled_avg_price)
         except Exception as e:
             # Standing stop may have already filled and closed the position.
             # Fetch it to recover the actual exit price instead of marking as FAILED.
@@ -295,8 +313,8 @@ class TradeManager:
                         self.exit_reason = reason
                         self.exit_avg_px = fill
                         return
-                except Exception:
-                    pass
+                except Exception as e2:
+                    log.warning(f"  ⚠ stop order recovery failed: {e2}")
             log.error(f"  ❌ force-sell failed: {e}")
             self.exit_reason = f"{reason}_FAILED"
 

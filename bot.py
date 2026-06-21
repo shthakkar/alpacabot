@@ -29,6 +29,7 @@ from orders       import (
     is_market_open, list_positions, list_open_orders,
     submit_market_buy, wait_for_fill, get_order, get_buying_power,
 )
+from alpaca.trading.enums import OrderStatus
 from trade_manager import TradeManager, EOD_EXIT_TIME
 
 # ---------------- logging ----------------
@@ -83,7 +84,7 @@ class Bot:
         log.info(f"  Signal        : Mean Rev BB+RSI 65/35")
         log.info(f"  Target        : initial × 1.06 (locked)")
         log.info(f"  Stop          : avg × 0.92 (market stop)")
-        log.info(f"  Avg-ups       : +1.5% / +3.0% (stop-limit BUY)")
+        log.info(f"  Avg-ups       : +1.5% / +3.0% (poll bid → market BUY)")
         log.info(f"  Time exit     : 30 min")
         log.info("=" * 60)
 
@@ -238,6 +239,11 @@ class Bot:
             log.warning(f"  ⚠ spread ${opt['spread']:.2f} > ${MAX_SPREAD:.2f} — skipping entry")
             return
 
+        # Guard against zero-bid (stale/illiquid contract — spread would be NaN)
+        if opt["bid"] <= 0:
+            log.warning(f"  ⚠ bid=${opt['bid']:.2f} ≤ 0 — skipping entry (illiquid contract)")
+            return
+
         entry_cost = opt["ask"] * 100  # cost of 1 contract
 
         # Dynamic position sizing based on current buying power.
@@ -282,7 +288,7 @@ class Bot:
             log.error(f"  ❌ entry submit/fill failed: {e}")
             return
 
-        if filled.status.value != "filled":
+        if filled.status != OrderStatus.FILLED:
             log.error(f"  ❌ entry status={filled.status} (not filled). Aborting.")
             return
 
