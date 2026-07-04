@@ -13,14 +13,13 @@ import logging
 import signal
 import sys
 import time
-from datetime import datetime, time as dt_time, timedelta
+from datetime import datetime, time as dt_time
 
 import pandas as pd
 
 from config       import (PAPER, CHECK_SECS, ET,
                           MARKET_OPEN, MARKET_CLOSE, LAST_ENTRY,
-                          LIMIT_TARGET_PCT, STOP_PCT, DAILY_LOSS_LIMIT,
-                          LOSS_COOLDOWN_MIN)
+                          LIMIT_TARGET_PCT, STOP_PCT, DAILY_LOSS_LIMIT)
 from data         import fetch_spy_bars
 from indicators   import add_indicators
 from signals      import check_signal
@@ -70,7 +69,7 @@ class Bot:
         self._last_bar_ts = None
         self._frozen_count = 0
         self.daily_pnl = 0.0
-        self._loss_cooldown_until: datetime | None = None
+        self._cooldown_side: str | None = None   # "CALL" or "PUT" — blocks same-direction re-entry until SPY recovers past BB
 
     # ---------- startup ----------
     def startup_checks(self):
@@ -126,8 +125,9 @@ class Bot:
             except Exception as e:
                 log.exception(f"  ❌ cycle error: {e}")
 
-            elapsed = time.time() - cycle_start
-            sleep_for = max(1.0, CHECK_SECS - elapsed)
+            now = time.time()
+            next_tick = (now // CHECK_SECS + 1) * CHECK_SECS
+            sleep_for = max(0.1, next_tick - now)
             time.sleep(sleep_for)
 
         log.info("Bot exiting cleanly.")
@@ -203,6 +203,14 @@ class Bot:
                  f"signal={'CALL' if call_sig else ('PUT' if put_sig else 'none')}"
                  f"{'  [wind-down: no new entries]' if wind_down else ''}")
 
+        # Clear BB-based cooldown once SPY recovers past the band
+        if self._cooldown_side == "CALL" and price > last['bb_lower']:
+            log.info(f"  ✅ loss cooldown lifted — SPY {price:.2f} recovered above BBl {last['bb_lower']:.2f}")
+            self._cooldown_side = None
+        elif self._cooldown_side == "PUT" and price < last['bb_upper']:
+            log.info(f"  ✅ loss cooldown lifted — SPY {price:.2f} pulled back below BBu {last['bb_upper']:.2f}")
+            self._cooldown_side = None
+
         if not (call_sig or put_sig):
             return
 
@@ -214,12 +222,14 @@ class Bot:
             log.warning(f"  🚫 daily loss limit hit (${self.daily_pnl:+.2f}) — no new entries today")
             return
 
-        if self._loss_cooldown_until and now < self._loss_cooldown_until:
-            remaining = int((self._loss_cooldown_until - now).total_seconds() / 60) + 1
-            log.info(f"  ⏳ loss cooldown active — {remaining}min remaining, skipping entry")
+        direction = "CALL" if call_sig else "PUT"
+
+        if self._cooldown_side == direction:
+            bb_val = last['bb_lower'] if direction == "CALL" else last['bb_upper']
+            side_word = f"below BBl {bb_val:.2f}" if direction == "CALL" else f"above BBu {bb_val:.2f}"
+            log.info(f"  ⏳ loss cooldown — SPY={price:.2f} still {side_word}, skipping {direction}")
             return
 
-        direction = "CALL" if call_sig else "PUT"
         self._enter_trade(direction, price, now)
 
     def _enter_trade(self, direction: str, spy_price: float, now: datetime):
@@ -246,10 +256,9 @@ class Bot:
 
         entry_cost = opt["ask"] * 100  # cost of 1 contract
 
-        # Dynamic position sizing based on current buying power.
-        # max_per_trade = half the account. slots = how many contracts fit
-        # assuming worst-case avg-up 2 price (entry × 1.03).
-        # entry_qty = slots − 2 (reserve 2 for avg-ups), capped at 5.
+        # 3-slot position sizing with 1.03 conservative factor.
+        # Prioritizes 3 slots (entry + avg-up1 + avg-up2) whenever possible.
+        # Safety: max 50% of buying power per trade.
         try:
             buying_power = get_buying_power()
         except Exception as e:
@@ -257,21 +266,22 @@ class Bot:
             return
 
         max_per_trade = buying_power / 2
-        slots = int(max_per_trade / (entry_cost * 1.03))
+        total_qty = int(max_per_trade / (entry_cost * 1.03))
 
-        if slots < 3:
-            entry_qty      = 1
-            allowed_avg_ups = 0
-        elif slots == 3:
-            entry_qty      = 1
-            allowed_avg_ups = 2
-        else:
-            entry_qty      = min(slots - 2, 5)  # cap at 5
-            allowed_avg_ups = 2
+        if total_qty < 1:
+            log.warning(f"  ⚠ insufficient budget for entry (${buying_power:.0f} / ${entry_cost * 1.03:.2f} = {total_qty} contracts)")
+            return
+
+        # Extreme back-loading (1-X-X): entry=1 always, rest split between avg-ups
+        entry_qty = 1
+        remaining = total_qty - 1
+        avg1_qty = remaining // 2
+        avg2_qty = remaining - avg1_qty
+        allowed_avg_ups = 2 if total_qty >= 3 else 0
 
         log.info(
-            f"     sizing: buying_power=${buying_power:.0f}  max_per_trade=${max_per_trade:.0f}"
-            f"  slots={slots}  entry_qty={entry_qty}  avg_ups_allowed={allowed_avg_ups}"
+            f"     sizing: buying_power=${buying_power:.0f}  max_trade=${max_per_trade:.0f}"
+            f"  total_qty={total_qty}  distribution={entry_qty}-{avg1_qty}-{avg2_qty}  avg_ups={allowed_avg_ups}"
         )
 
         # Plain market BUY. Stop SELL is submitted by TradeManager before
@@ -328,8 +338,9 @@ class Bot:
             self.daily_pnl += pnl
             log.info(f"  📊 daily P&L: ${self.daily_pnl:+.2f}")
             if pnl < 0:
-                self._loss_cooldown_until = datetime.now(ET) + timedelta(minutes=LOSS_COOLDOWN_MIN)
-                log.info(f"  ⏳ loss cooldown — no new entries until {self._loss_cooldown_until.strftime('%H:%M:%S')} ET")
+                self._cooldown_side = t.direction
+                recover_cond = "above BBl" if t.direction == "CALL" else "below BBu"
+                log.info(f"  ⏳ loss cooldown — no new {t.direction} entries until SPY recovers {recover_cond}")
 
 
 if __name__ == "__main__":
