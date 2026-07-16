@@ -37,7 +37,7 @@ CANDLE_RETRIES     = 5
 CANDLE_RETRY_SLEEP = 5   # seconds between retries
 
 # Trade management poll interval
-CHECK_SECS = 30
+CHECK_SECS = 15
 
 # Entry guards
 MAX_SPREAD         = 0.50
