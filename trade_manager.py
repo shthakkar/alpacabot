@@ -46,7 +46,9 @@ class TradeManager:
                  entry_fill_price: float, entered_at: datetime,
                  target_id: str = None, stop_id: str = None,
                  entry_qty: int = 1,
-                 allowed_avg_ups: int = 2):
+                 allowed_avg_ups: int = 2,
+                 avg1_qty: int = 0,
+                 avg2_qty: int = 0):
         self.symbol             = symbol
         self.direction          = direction          # "CALL" or "PUT" (informational)
         self.entered_at         = entered_at
@@ -72,6 +74,8 @@ class TradeManager:
         self.avg_up_2_done = False
 
         self.allowed_avg_ups = allowed_avg_ups
+        self.avg1_qty = avg1_qty
+        self.avg2_qty = avg2_qty
 
         # Final state for summary
         self.exit_reason  = None
@@ -199,9 +203,15 @@ class TradeManager:
     def _execute_avg_up(self, which: int):
         """
         Cancel the standing stop (to clear Alpaca's wash-trade check),
-        submit a market BUY, wait for fill, then _handle_avg_up_fill()
-        re-submits the stop at the updated price/qty.
+        submit a market BUY for the planned quantity, wait for fill,
+        then _handle_avg_up_fill() re-submits the stop at the updated price/qty.
         """
+        # Determine quantity for this avg-up
+        qty = self.avg1_qty if which == 1 else self.avg2_qty
+        if qty <= 0:
+            log.warning(f"  ⚠ avg_up_{which} qty is {qty} — skipping")
+            return
+
         # Mark done BEFORE submit so we don't retrigger in the same poll.
         # We reset the flag in the except block if submit fails so the next
         # tick can retry.
@@ -211,13 +221,13 @@ class TradeManager:
             self.avg_up_2_done = True
         self._cancel_one("stop")  # must clear SELL before BUY or Alpaca rejects
         try:
-            order = submit_market_buy(self.symbol, 1)
+            order = submit_market_buy(self.symbol, qty)
             filled = wait_for_fill(order.id, timeout=AVG_UP_FILL_TIMEOUT)
             if filled.filled_avg_price is None:
                 raise ValueError(f"avg-up filled but filled_avg_price is None")
             fill_px = float(filled.filled_avg_price)
             log.info(f"  📈 AVG_UP_{which} FILLED @ ${fill_px:.2f}")
-            self._handle_avg_up_fill(which, fill_px)  # re-submits stop inside
+            self._handle_avg_up_fill(which, qty, fill_px)  # re-submits stop inside
         except Exception as e:
             log.error(f"  ❌ avg_up_{which} market-buy failed: {e}")
             # Reset flag so next tick can retry
@@ -233,12 +243,16 @@ class TradeManager:
             except Exception as e2:
                 log.error(f"  ❌ stop re-submit failed: {e2} — position unprotected!")
 
-    def _handle_avg_up_fill(self, which: int, fill_price: float):
+    def _handle_avg_up_fill(self, which: int, qty: int, fill_price: float):
         """Avg-up fired → update avg, atomically resize stop & target via PATCH."""
-        self.fills.append(fill_price)
-        self.contracts += 1
+        self.fills.extend([fill_price] * qty)
+        self.contracts += qty
         self.avg_cost   = sum(self.fills) / len(self.fills)
-        self.stop_price = self.avg_cost * (1 - STOP_PCT)
+        # After 2nd avg-up, lock stop to original entry price to protect against big losses
+        if which == 2:
+            self.stop_price = self.initial_entry
+        else:
+            self.stop_price = self.avg_cost * (1 - STOP_PCT)
         # Target stays unchanged — it's locked to initial_entry
 
         # avg_up_N_done was already set True in _execute_avg_up before the BUY fired

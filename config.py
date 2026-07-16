@@ -48,7 +48,7 @@ TIME_EXIT_MIN = 30
 OPTION_CHAIN_DAYS = 7
 
 # Loop / hours
-CHECK_SECS   = 30
+CHECK_SECS   = 15
 MARKET_OPEN  = datetime.time(10, 0)    # earliest signal entries (10:00 ET / 7:00 PT)
 LAST_ENTRY   = datetime.time(15, 15)   # no new entries after this — 30 min runway before EOD
 MARKET_CLOSE = datetime.time(16, 0)    # NYSE close (used for reference only)

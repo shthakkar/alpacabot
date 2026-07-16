@@ -8,22 +8,14 @@
 #   python alpaca_verify.py
 # ================================================================
 
-import os
-
 from alpaca.trading.client import TradingClient
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestTradeRequest
 
 # ---------- CREDENTIALS ----------
-API_KEY    = os.environ.get("ALPACA_API_KEY", "")
-API_SECRET = os.environ.get("ALPACA_API_SECRET", "")
-PAPER      = os.environ.get("ALPACA_PAPER", "true").lower() != "false"  # True = paper account
-
-if not API_KEY or not API_SECRET:
-    raise SystemExit(
-        "Missing Alpaca credentials. Set ALPACA_API_KEY and ALPACA_API_SECRET "
-        "(see .env.example)."
-    )
+API_KEY    = "PKUIH6DMVHXVP5UKX7YCEZ6U3N"
+API_SECRET = "ANg9o9prUvjKcgV34awwAVGT8MTBfpxNBktg1sH9Z64A"
+PAPER      = True   # True = paper account, False = live
 # ---------------------------------
 
 

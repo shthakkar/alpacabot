@@ -46,8 +46,14 @@ class _EventsFilter(logging.Filter):
     def filter(self, record):
         return not any(s in record.getMessage() for s in self._SKIP)
 
+class _FlushedFileHandler(logging.FileHandler):
+    """FileHandler that flushes on every emit (every log message)."""
+    def emit(self, record):
+        super().emit(record)
+        self.flush()
+
 _logdate = datetime.now().strftime("%Y%m%d")
-_ef = logging.FileHandler(f"logs/events_{_logdate}.log")
+_ef = _FlushedFileHandler(f"logs/events_{_logdate}.log")
 _ef.setFormatter(_fmt)
 _ef.addFilter(_EventsFilter())
 log.addHandler(_ef)
@@ -59,7 +65,7 @@ ACTIVE_END_TIME   = EOD_EXIT_TIME                                    # 15:45 ET 
 MAX_SPREAD        = 0.50      # skip entry if bid-ask spread wider than this
 ENTRY_FILL_TIMEOUT = 30       # seconds to wait for entry market order to fill
 STALE_DATA_SEC    = 420       # skip cycle if latest bar > 7 min old (covers 5-min bar + IEX latency)
-FROZEN_BAR_LIMIT  = 12        # same bar seen 12×30s = 6 min → likely frozen feed
+FROZEN_BAR_LIMIT  = 24        # same bar seen 24×15s = 6 min → likely frozen feed
 
 
 class Bot:
@@ -135,6 +141,13 @@ class Bot:
     def _handle_signal(self, signum, frame):
         log.info(f"\n  ⚠ received signal {signum} — shutting down after this cycle")
         self._shutting_down = True
+
+    def cleanup(self):
+        """Flush all log handlers before exit."""
+        for handler in log.handlers:
+            handler.flush()
+            handler.close()
+        log.removeHandler(log.handlers[0]) if log.handlers else None
 
     # ---------- per-cycle ----------
     def cycle(self):
@@ -309,6 +322,8 @@ class Bot:
             opt["symbol"], direction, fill_price, now,
             entry_qty=entry_qty,
             allowed_avg_ups=allowed_avg_ups,
+            avg1_qty=avg1_qty,
+            avg2_qty=avg2_qty,
         )
         try:
             self.trade.submit_management_orders()
@@ -344,4 +359,8 @@ class Bot:
 
 
 if __name__ == "__main__":
-    Bot().run()
+    bot = Bot()
+    try:
+        bot.run()
+    finally:
+        bot.cleanup()
